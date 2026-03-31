@@ -7,7 +7,6 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 from __future__ import annotations
 
 import glob
-import json
 import math
 import os
 import pickle
@@ -25,6 +24,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
+
+from data.challenge_data import validate_dataset_tokenizer_pair
 
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
@@ -52,6 +53,7 @@ class Hyperparameters:
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_max_tokens: int = int(os.environ.get("VAL_MAX_TOKENS", 0))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
@@ -76,6 +78,8 @@ class Hyperparameters:
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
+    struct_enable: bool = bool(int(os.environ.get("STRUCT_ENABLE", "0")))
+    struct_specialist_rank: int = int(os.environ.get("STRUCT_SPECIALIST_RANK", 16))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -379,6 +383,90 @@ class Block(nn.Module):
         return x
 
 
+STRUCT_FLAG_URL_SHIFT = 0
+STRUCT_FLAG_CODE_SHIFT = 1
+STRUCT_FLAG_NUMERIC_SHIFT = 2
+STRUCT_FLAG_QUOTE_SHIFT = 3
+
+STRUCT_FLAG_URL_MASK = 1
+STRUCT_FLAG_CODE_MASK = 1
+STRUCT_FLAG_NUMERIC_MASK = 1
+STRUCT_FLAG_QUOTE_MASK = 1
+
+STRUCT_SPECIALIST_COUNT = 4
+STRUCT_ROUTE_WINDOWS = (8, 6, 4, 6)
+
+STRUCT_NON_EXPORT_STATE_KEYS = {
+    "struct.struct_bits_lut",
+}
+STRUCT_LOCAL_FROZEN_KEYS = [
+    "struct_bits_lut",
+]
+
+
+class SpecialistAdapter(nn.Module):
+    def __init__(self, dim: int, rank: int, init_std: float):
+        super().__init__()
+        self.norm = RMSNormNoWeight()
+        self.down = CastedLinear(dim, rank)
+        self.up = CastedLinear(rank, dim)
+        self.down.weight = (mx.random.normal(self.down.weight.shape, dtype=mx.float32) * init_std).astype(mx.float32)
+        self.up.weight = (mx.random.normal(self.up.weight.shape, dtype=mx.float32) * (init_std * 0.1)).astype(mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        h = nn.relu(self.down(self.norm(x)).astype(COMPUTE_DTYPE))
+        return self.up(h).astype(COMPUTE_DTYPE)
+
+
+class StructFeatureEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        init_std: float,
+        struct_bits_lut: np.ndarray,
+        specialist_rank: int,
+    ):
+        super().__init__()
+        self.struct_bits_lut = mx.array(struct_bits_lut.astype(np.int16, copy=False))
+        self.route_mix = (mx.eye(STRUCT_SPECIALIST_COUNT, dtype=mx.float32) * 1.5).astype(mx.float32)
+        self.route_bias = mx.full((STRUCT_SPECIALIST_COUNT,), -4.0, dtype=mx.float32)
+        self.output_scale = mx.array(0.02, dtype=mx.float32)
+        self.adapters = [SpecialistAdapter(dim, specialist_rank, init_std) for _ in range(STRUCT_SPECIALIST_COUNT)]
+        self.freeze(keys=STRUCT_LOCAL_FROZEN_KEYS, strict=False)
+
+    def _field(self, packed_bits: mx.array, shift: int, mask: int) -> mx.array:
+        return (packed_bits >> shift) & mask
+
+    def _recent_active(self, marker: mx.array, window: int) -> mx.array:
+        active = marker
+        for offset in range(1, window):
+            shifted = mx.concatenate(
+                [mx.zeros((marker.shape[0], offset), dtype=marker.dtype), marker[:, :-offset]],
+                axis=1,
+            )
+            active = mx.maximum(active, shifted)
+        return active
+
+    def __call__(self, x: mx.array, input_ids: mx.array) -> mx.array:
+        packed_bits = self.struct_bits_lut[input_ids].astype(mx.int32)
+        markers = [
+            self._field(packed_bits, STRUCT_FLAG_URL_SHIFT, STRUCT_FLAG_URL_MASK).astype(COMPUTE_DTYPE),
+            self._field(packed_bits, STRUCT_FLAG_CODE_SHIFT, STRUCT_FLAG_CODE_MASK).astype(COMPUTE_DTYPE),
+            self._field(packed_bits, STRUCT_FLAG_NUMERIC_SHIFT, STRUCT_FLAG_NUMERIC_MASK).astype(COMPUTE_DTYPE),
+            self._field(packed_bits, STRUCT_FLAG_QUOTE_SHIFT, STRUCT_FLAG_QUOTE_MASK).astype(COMPUTE_DTYPE),
+        ]
+        states = mx.stack(
+            [self._recent_active(marker, window) for marker, window in zip(markers, STRUCT_ROUTE_WINDOWS, strict=True)],
+            axis=-1,
+        ).astype(COMPUTE_DTYPE)
+        route_logits = states @ self.route_mix.astype(COMPUTE_DTYPE) + self.route_bias.astype(COMPUTE_DTYPE)
+        route = mx.sigmoid(route_logits)
+        delta = mx.zeros_like(x)
+        for idx, adapter in enumerate(self.adapters):
+            delta = delta + route[:, :, idx:idx + 1] * adapter(x).astype(COMPUTE_DTYPE)
+        return (self.output_scale.astype(COMPUTE_DTYPE) * delta).astype(COMPUTE_DTYPE)
+
+
 class GPT(nn.Module):
     # - token embedding + RMSNorm
     # - encoder half accumulates skip tensors
@@ -386,7 +474,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, struct_bits_lut: np.ndarray | None = None, struct_specialist_rank: int = 16):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -394,6 +482,14 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.struct = None
+        if struct_bits_lut is not None:
+            self.struct = StructFeatureEmbedding(
+                dim=dim,
+                init_std=tied_embed_init_std,
+                struct_bits_lut=struct_bits_lut,
+                specialist_rank=struct_specialist_rank,
+            )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -416,7 +512,10 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
+        x = rms_norm(x)
+        if self.struct is not None:
+            x = x + self.struct(x, input_ids)
         x0 = x
         skips: list[mx.array] = []
 
@@ -489,8 +588,11 @@ class SplitOptimizers:
     # This preserves the high-level optimization behavior even though MLX internals differ.
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
-        params = dict(tree_flatten(model.parameters()))
-        self.embed_key = "tok_emb.weight"
+        params = dict(tree_flatten(model.trainable_parameters()))
+        self.embed_keys = [
+            k for k, p in params.items()
+            if k == "tok_emb.weight" or (k.startswith("struct.") and p.ndim >= 2)
+        ]
         self.matrix_keys = [
             k
             for k, p in params.items()
@@ -499,7 +601,9 @@ class SplitOptimizers:
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k == "skip_weights"
+            or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            or (k.startswith("struct.") and p.ndim < 2)
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -517,7 +621,7 @@ class SplitOptimizers:
         )
 
     def step(self, model: GPT, grads_tree: dict, step: int, lr_mul: float) -> None:
-        params = dict(tree_flatten(model.parameters()))
+        params = dict(tree_flatten(model.trainable_parameters()))
         grads = dict(tree_flatten(grads_tree))
         updated = dict(params)
 
@@ -526,8 +630,8 @@ class SplitOptimizers:
         self.adam_embed.learning_rate = self.args.tied_embed_lr * lr_mul
         updated.update(
             self.adam_embed.apply_gradients(
-                {self.embed_key: grads[self.embed_key]},
-                {self.embed_key: params[self.embed_key]},
+                {k: grads[k] for k in self.embed_keys},
+                {k: params[k] for k in self.embed_keys},
             )
         )
 
@@ -668,12 +772,19 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     sp_vocab_size = int(sp.vocab_size())
     table_size = max(sp_vocab_size, vocab_size)
     base_bytes_lut = np.zeros((table_size,), dtype=np.int16)
     has_leading_space_lut = np.zeros((table_size,), dtype=np.bool_)
     is_boundary_token_lut = np.ones((table_size,), dtype=np.bool_)
+    struct_bits_lut = np.zeros((table_size,), dtype=np.int16)
+
+    def strip_leading_space(piece: str) -> tuple[bool, str]:
+        if piece.startswith("▁"):
+            return True, piece[1:]
+        return False, piece
+
     for token_id in range(sp_vocab_size):
         if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
             continue
@@ -682,48 +793,36 @@ def build_sentencepiece_luts(
             base_bytes_lut[token_id] = 1
             continue
         piece = sp.id_to_piece(token_id)
-        if piece.startswith("▁"):
-            has_leading_space_lut[token_id] = True
-            piece = piece[1:]
-        base_bytes_lut[token_id] = len(piece.encode("utf-8"))
-    return base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
-
-
-def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tuple[str, int, int | None]:
-    # The shard directory and tokenizer are coupled: val_bpb is only meaningful if we
-    # decode bytes with the exact tokenizer that produced the shards. The manifest
-    # lets the training script fail fast on accidental dataset/tokenizer mismatches.
-    dataset_dir = Path(data_path).resolve()
-    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    if len(dataset_dir.parents) < 2:
-        return dataset_dir.name, actual_train_files, None
-    manifest_path = dataset_dir.parents[1] / "manifest.json"
-    if not manifest_path.is_file():
-        return dataset_dir.name, actual_train_files, None
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    dataset_entry = next((x for x in manifest.get("datasets", []) if x.get("name") == dataset_dir.name), None)
-    if dataset_entry is None:
-        return dataset_dir.name, actual_train_files, None
-
-    tokenizer_name = dataset_entry.get("tokenizer_name")
-    tokenizer_entry = (
-        next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
-        if tokenizer_name
-        else None
+        has_leading_space, text = strip_leading_space(piece)
+        has_leading_space_lut[token_id] = has_leading_space
+        base_bytes_lut[token_id] = len(text.encode("utf-8"))
+        lower = text.lower()
+        digit_count = sum(ch.isdigit() for ch in text)
+        url_flag = int(
+            any(marker in lower for marker in ("http", "www", "href", ".com", ".org", ".net", ".gov", ".edu", ".io", "mailto"))
+            or ("@" in text and "." in text)
+        )
+        code_flag = int(
+            any(marker in lower for marker in ("```", "def", "class", "import", "return", "function", "const", "let", "var", "#include"))
+            or any(marker in text for marker in ("=>", "::", "{", "}", ";"))
+        )
+        numeric_flag = int(
+            digit_count >= 2
+            or (digit_count >= 1 and any(ch in text for ch in "$%"))
+        )
+        quote_flag = int(any(ch in text for ch in ('"', "`", "“", "”")))
+        struct_bits_lut[token_id] = np.int16(
+            (url_flag << STRUCT_FLAG_URL_SHIFT)
+            | (code_flag << STRUCT_FLAG_CODE_SHIFT)
+            | (numeric_flag << STRUCT_FLAG_NUMERIC_SHIFT)
+            | (quote_flag << STRUCT_FLAG_QUOTE_SHIFT)
+        )
+    return (
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        struct_bits_lut,
     )
-    expected_name = Path((tokenizer_entry or {}).get("model_path") or (tokenizer_entry or {}).get("path") or "").name
-    if expected_name and Path(tokenizer_path).name != expected_name:
-        raise ValueError(f"{dataset_dir.name} expects tokenizer {expected_name}, got {Path(tokenizer_path).name}")
-    expected_train_files = (dataset_entry.get("stats") or {}).get("files_train")
-    if expected_train_files is not None:
-        expected_train_files = int(expected_train_files)
-        if actual_train_files > expected_train_files:
-            raise ValueError(
-                f"{dataset_dir.name} has more train shards than expected: found {actual_train_files}, "
-                f"manifest says {expected_train_files}"
-            )
-    return dataset_dir.name, actual_train_files, expected_train_files
 
 
 def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
@@ -870,8 +969,18 @@ def main() -> None:
         args.tokenizer_path,
     )
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    if args.val_max_tokens > 0:
+        usable = (min(args.val_max_tokens, val_tokens.size - 1) // args.train_seq_len) * args.train_seq_len
+        if usable <= 0:
+            raise ValueError(f"VAL_MAX_TOKENS={args.val_max_tokens} is too small for TRAIN_SEQ_LEN={args.train_seq_len}")
+        val_tokens = val_tokens[: usable + 1]
 
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+    (
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        struct_bits_lut,
+    ) = build_sentencepiece_luts(
         sp, args.vocab_size
     )
 
@@ -897,6 +1006,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        struct_bits_lut=struct_bits_lut if args.struct_enable else None,
+        struct_specialist_rank=args.struct_specialist_rank,
     )
     opt = SplitOptimizers(model, args)
 
@@ -915,11 +1026,12 @@ def main() -> None:
     )
 
     # Print config once so logs are self-describing.
-    n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
+    n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.trainable_parameters()))
     log(f"run_id:{args.run_id}")
     log(f"mlx_version:{mx.__version__}")
     log(f"train_loader:shards pattern={args.train_files}")
     log(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.size - 1}")
+    log(f"struct_enable:{int(args.struct_enable)} struct_specialist_rank:{args.struct_specialist_rank}")
     if expected_train_files is None:
         log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}")
     elif actual_train_files < expected_train_files:
@@ -936,6 +1048,7 @@ def main() -> None:
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
+    log(f"struct_embed:enabled={int(args.struct_enable)}")
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
@@ -1063,7 +1176,11 @@ def main() -> None:
     # quantized roundtrip directly by loading the dequantized tensors back into the
     # model and running one final validation pass.
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
-    flat_state = {k: v for k, v in tree_flatten(model.state)}
+    flat_state = {
+        k: v
+        for k, v in tree_flatten(model.state)
+        if k not in STRUCT_NON_EXPORT_STATE_KEYS
+    }
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 

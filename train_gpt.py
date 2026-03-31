@@ -27,6 +27,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from data.challenge_data import validate_dataset_tokenizer_pair
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -69,6 +71,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    struct_enable = bool(int(os.environ.get("STRUCT_ENABLE", "0")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -179,29 +182,201 @@ class Muon(torch.optim.Optimizer):
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     sp_vocab_size = int(sp.vocab_size())
     table_size = max(sp_vocab_size, vocab_size)
     base_bytes_np = np.zeros((table_size,), dtype=np.int16)
     has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
     is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
+    struct_bits_np = np.zeros((table_size,), dtype=np.int16)
+    has_newline_np = np.zeros((table_size,), dtype=np.bool_)
+    ends_sentence_np = np.zeros((table_size,), dtype=np.bool_)
+
+    role_shift = 0
+    shape_shift = 6
+
+    role_byte = 1
+    role_word_start = 2
+    role_word_cont = 3
+    role_punct = 4
+    role_other = 5
+
+    shape_other = 0
+    shape_lower = 1
+    shape_title = 2
+    shape_upper = 3
+    shape_numeric = 4
+    shape_alnum = 5
+    shape_punct = 6
+    shape_urlish = 7
+
+    def strip_leading_space(piece: str) -> tuple[bool, str]:
+        if piece.startswith("▁"):
+            return True, piece[1:]
+        return False, piece
+
+    def is_punct_piece(text: str) -> bool:
+        return bool(text) and all((not ch.isalnum()) and (not ch.isspace()) for ch in text)
+
+    def shape_id_for_text(text: str) -> int:
+        if not text:
+            return shape_other
+        if is_punct_piece(text):
+            return shape_punct
+        if text.isdigit():
+            return shape_numeric
+        if text.isalpha() and text.islower():
+            return shape_lower
+        if len(text) > 1 and text[0].isupper() and text[1:].islower() and text.isalpha():
+            return shape_title
+        if text.isalpha() and text.isupper():
+            return shape_upper
+        if any(ch.isalpha() for ch in text) and any(ch.isdigit() for ch in text):
+            return shape_alnum
+        if any(ch in "/\\._-:@#~" for ch in text):
+            return shape_urlish
+        return shape_other
+
     for token_id in range(sp_vocab_size):
         if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
             continue
         is_boundary_token_np[token_id] = False
         if sp.is_byte(token_id):
             base_bytes_np[token_id] = 1
+            struct_bits_np[token_id] = int(role_byte << role_shift)
             continue
         piece = sp.id_to_piece(token_id)
-        if piece.startswith("▁"):
-            has_leading_space_np[token_id] = True
-            piece = piece[1:]
-        base_bytes_np[token_id] = len(piece.encode("utf-8"))
+        has_leading_space, text = strip_leading_space(piece)
+        has_leading_space_np[token_id] = has_leading_space
+        base_bytes_np[token_id] = len(text.encode("utf-8"))
+        has_newline_np[token_id] = "\n" in text or "\r" in text
+        ends_sentence_np[token_id] = bool(text) and text[-1] in ".!?"
+
+        if is_punct_piece(text):
+            role_id = role_punct
+        elif has_leading_space:
+            role_id = role_word_start
+        elif text:
+            role_id = role_word_cont
+        else:
+            role_id = role_other
+        shape_id = shape_id_for_text(text)
+        struct_bits_np[token_id] = int((role_id << role_shift) | (shape_id << shape_shift))
     return (
         torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
+        torch.tensor(struct_bits_np, dtype=torch.int16, device=device),
+        torch.tensor(has_newline_np, dtype=torch.bool, device=device),
+        torch.tensor(ends_sentence_np, dtype=torch.bool, device=device),
     )
+
+
+# Packed struct bit layout inside the token-side annotation buffer:
+# [segment:3][shape:4][wordpos:3][role:3]
+STRUCT_ROLE_BITS = 3
+STRUCT_WORDPOS_BITS = 3
+STRUCT_SHAPE_BITS = 4
+STRUCT_SEGMENT_BITS = 3
+
+STRUCT_ROLE_SHIFT = 0
+STRUCT_WORDPOS_SHIFT = STRUCT_ROLE_SHIFT + STRUCT_ROLE_BITS
+STRUCT_SHAPE_SHIFT = STRUCT_WORDPOS_SHIFT + STRUCT_WORDPOS_BITS
+STRUCT_SEGMENT_SHIFT = STRUCT_SHAPE_SHIFT + STRUCT_SHAPE_BITS
+
+STRUCT_ROLE_MASK = (1 << STRUCT_ROLE_BITS) - 1
+STRUCT_WORDPOS_MASK = (1 << STRUCT_WORDPOS_BITS) - 1
+STRUCT_SHAPE_MASK = (1 << STRUCT_SHAPE_BITS) - 1
+STRUCT_SEGMENT_MASK = (1 << STRUCT_SEGMENT_BITS) - 1
+
+STRUCT_ROLE_CLASSES = 1 << STRUCT_ROLE_BITS
+STRUCT_WORDPOS_CLASSES = 1 << STRUCT_WORDPOS_BITS
+STRUCT_SHAPE_CLASSES = 1 << STRUCT_SHAPE_BITS
+STRUCT_SEGMENT_CLASSES = 1 << STRUCT_SEGMENT_BITS
+
+STRUCT_SEGMENT_DEFAULT = 0
+STRUCT_SEGMENT_BOS = 1
+STRUCT_SEGMENT_AFTER_NEWLINE = 2
+STRUCT_SEGMENT_AFTER_SENTENCE = 3
+
+
+class StructFeatureEmbedding(nn.Module):
+    """Compact token-structure side channel with packed storage and factorized embeddings."""
+
+    def __init__(
+        self,
+        model_dim: int,
+        init_std: float,
+        struct_bits_lut: Tensor,
+        has_leading_space_lut: Tensor,
+        is_boundary_token_lut: Tensor,
+        has_newline_lut: Tensor,
+        ends_sentence_lut: Tensor,
+    ):
+        super().__init__()
+        self.role_emb = nn.Embedding(STRUCT_ROLE_CLASSES, model_dim)
+        self.wordpos_emb = nn.Embedding(STRUCT_WORDPOS_CLASSES, model_dim)
+        self.shape_emb = nn.Embedding(STRUCT_SHAPE_CLASSES, model_dim)
+        self.segment_emb = nn.Embedding(STRUCT_SEGMENT_CLASSES, model_dim)
+        self.register_buffer("struct_bits_lut", struct_bits_lut.to(dtype=torch.int16), persistent=False)
+        self.register_buffer("has_leading_space_lut", has_leading_space_lut.to(dtype=torch.bool), persistent=False)
+        self.register_buffer("is_boundary_token_lut", is_boundary_token_lut.to(dtype=torch.bool), persistent=False)
+        self.register_buffer("has_newline_lut", has_newline_lut.to(dtype=torch.bool), persistent=False)
+        self.register_buffer("ends_sentence_lut", ends_sentence_lut.to(dtype=torch.bool), persistent=False)
+        self.init_std = init_std
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for emb in (self.role_emb, self.wordpos_emb, self.shape_emb, self.segment_emb):
+            nn.init.normal_(emb.weight, mean=0.0, std=self.init_std)
+
+    def _compute_wordpos_ids(self, input_ids: Tensor) -> Tensor:
+        has_leading_space = self.has_leading_space_lut[input_ids]
+        is_boundary_token = self.is_boundary_token_lut[input_ids]
+        word_start = has_leading_space | is_boundary_token
+        word_start = word_start.clone()
+        word_start[:, 0] = True
+        positions = torch.arange(input_ids.size(1), device=input_ids.device, dtype=torch.long)
+        positions = positions.unsqueeze(0).expand_as(input_ids)
+        start_positions = torch.where(word_start, positions, -torch.ones_like(positions))
+        last_start_positions = torch.cummax(start_positions, dim=1).values
+        return (positions - last_start_positions).clamp_(min=0, max=3)
+
+    def _compute_segment_ids(self, input_ids: Tensor) -> Tensor:
+        has_newline = self.has_newline_lut[input_ids]
+        ends_sentence = self.ends_sentence_lut[input_ids]
+        prev_has_newline = torch.cat([torch.zeros_like(has_newline[:, :1]), has_newline[:, :-1]], dim=1)
+        prev_ends_sentence = torch.cat([torch.zeros_like(ends_sentence[:, :1]), ends_sentence[:, :-1]], dim=1)
+        segment_ids = torch.full_like(input_ids, STRUCT_SEGMENT_DEFAULT)
+        segment_ids = torch.where(
+            prev_ends_sentence,
+            torch.full_like(segment_ids, STRUCT_SEGMENT_AFTER_SENTENCE),
+            segment_ids,
+        )
+        segment_ids = torch.where(
+            prev_has_newline,
+            torch.full_like(segment_ids, STRUCT_SEGMENT_AFTER_NEWLINE),
+            segment_ids,
+        )
+        segment_ids[:, 0] = STRUCT_SEGMENT_BOS
+        return segment_ids
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        packed_bits = self.struct_bits_lut[input_ids].to(dtype=torch.long)
+        packed_bits = packed_bits | (self._compute_wordpos_ids(input_ids) << STRUCT_WORDPOS_SHIFT)
+        packed_bits = packed_bits | (self._compute_segment_ids(input_ids) << STRUCT_SEGMENT_SHIFT)
+
+        role_ids = (packed_bits >> STRUCT_ROLE_SHIFT) & STRUCT_ROLE_MASK
+        wordpos_ids = (packed_bits >> STRUCT_WORDPOS_SHIFT) & STRUCT_WORDPOS_MASK
+        shape_ids = (packed_bits >> STRUCT_SHAPE_SHIFT) & STRUCT_SHAPE_MASK
+        segment_ids = (packed_bits >> STRUCT_SEGMENT_SHIFT) & STRUCT_SEGMENT_MASK
+
+        return (
+            self.role_emb(role_ids)
+            + self.wordpos_emb(wordpos_ids)
+            + self.shape_emb(shape_ids)
+            + self.segment_emb(segment_ids)
+        )
 
 
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
@@ -659,6 +834,11 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        struct_bits_lut: Tensor | None = None,
+        has_leading_space_lut: Tensor | None = None,
+        is_boundary_token_lut: Tensor | None = None,
+        has_newline_lut: Tensor | None = None,
+        ends_sentence_lut: Tensor | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -667,6 +847,23 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.struct = None
+        if (
+            struct_bits_lut is not None
+            and has_leading_space_lut is not None
+            and is_boundary_token_lut is not None
+            and has_newline_lut is not None
+            and ends_sentence_lut is not None
+        ):
+            self.struct = StructFeatureEmbedding(
+                model_dim=model_dim,
+                init_std=tied_embed_init_std,
+                struct_bits_lut=struct_bits_lut,
+                has_leading_space_lut=has_leading_space_lut,
+                is_boundary_token_lut=is_boundary_token_lut,
+                has_newline_lut=has_newline_lut,
+                ends_sentence_lut=ends_sentence_lut,
+            )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -699,6 +896,8 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.struct is not None:
+            x = x + self.struct(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -809,15 +1008,25 @@ def main() -> None:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
-    dataset_dir = Path(args.data_path).resolve()
-    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
+    dataset_name, actual_train_files, _expected_train_files = validate_dataset_tokenizer_pair(
+        args.data_path,
+        args.tokenizer_path,
+    )
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+    (
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        struct_bits_lut,
+        has_newline_lut,
+        ends_sentence_lut,
+    ) = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
+    log0(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(f"struct_embed:enabled={int(args.struct_enable)}")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -835,6 +1044,11 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        struct_bits_lut=struct_bits_lut if args.struct_enable else None,
+        has_leading_space_lut=has_leading_space_lut if args.struct_enable else None,
+        is_boundary_token_lut=is_boundary_token_lut if args.struct_enable else None,
+        has_newline_lut=has_newline_lut if args.struct_enable else None,
+        ends_sentence_lut=ends_sentence_lut if args.struct_enable else None,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -862,8 +1076,11 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    embedding_params = [base_model.tok_emb.weight]
+    if base_model.struct is not None:
+        embedding_params.extend(list(base_model.struct.parameters()))
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": embedding_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,

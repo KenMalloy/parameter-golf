@@ -48,6 +48,7 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 500))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
+    val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", 0))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
@@ -88,6 +89,8 @@ class Hyperparameters:
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    prefix_control_enabled = bool(int(os.environ.get("PREFIX_CONTROL_ENABLED", "0")))
+    prefix_control_scale = float(os.environ.get("PREFIX_CONTROL_SCALE", 0.10))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.5))
@@ -174,14 +177,29 @@ class Muon(torch.optim.Optimizer):
 # TOKENIZER-AGNOSTIC EVALUATION
 # -----------------------------
 
+STRUCT_FLAG_URL_SHIFT = 0
+STRUCT_FLAG_CODE_SHIFT = 1
+STRUCT_FLAG_NUMERIC_SHIFT = 2
+STRUCT_FLAG_QUOTE_SHIFT = 3
+
+STRUCT_FLAG_URL_MASK = 1
+STRUCT_FLAG_CODE_MASK = 1
+STRUCT_FLAG_NUMERIC_MASK = 1
+STRUCT_FLAG_QUOTE_MASK = 1
+
+STRUCT_STATE_COUNT = 4
+STRUCT_ROUTE_WINDOWS = (8, 6, 4, 6)
+
+
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     sp_vocab_size = int(sp.vocab_size())
     table_size = max(sp_vocab_size, vocab_size)
     base_bytes_np = np.zeros((table_size,), dtype=np.int16)
     has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
     is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
+    struct_bits_np = np.zeros((table_size,), dtype=np.int16)
     for token_id in range(sp_vocab_size):
         if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
             continue
@@ -194,10 +212,35 @@ def build_sentencepiece_luts(
             has_leading_space_np[token_id] = True
             piece = piece[1:]
         base_bytes_np[token_id] = len(piece.encode("utf-8"))
+        lower = piece.lower()
+        digit_count = sum(ch.isdigit() for ch in piece)
+        punctuation_count = sum(ch in ":/.?&=@#%$+-_" for ch in piece)
+        url_flag = int(
+            any(marker in lower for marker in ("http", "www", "href", ".com", ".org", ".net", ".gov", ".edu", ".io", "mailto"))
+            or any(ch in piece for ch in (":", "/", "@", "?", "&", "=", "#"))
+            or ("." in piece and any(ch.isalpha() for ch in piece))
+        )
+        code_flag = int(
+            any(marker in lower for marker in ("```", "def", "class", "import", "return", "function", "const", "let", "var", "#include"))
+            or any(marker in piece for marker in ("=>", "::", "{", "}", ";", "->", "()"))
+        )
+        numeric_flag = int(
+            digit_count >= 1
+            or any(ch in piece for ch in "$%")
+            or (punctuation_count >= 2 and digit_count >= 1)
+        )
+        quote_flag = int(any(ch in piece for ch in ('"', "`", "“", "”")))
+        struct_bits_np[token_id] = np.int16(
+            (url_flag << STRUCT_FLAG_URL_SHIFT)
+            | (code_flag << STRUCT_FLAG_CODE_SHIFT)
+            | (numeric_flag << STRUCT_FLAG_NUMERIC_SHIFT)
+            | (quote_flag << STRUCT_FLAG_QUOTE_SHIFT)
+        )
     return (
         torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
+        torch.tensor(struct_bits_np, dtype=torch.int16, device=device),
     )
 
 
@@ -575,8 +618,11 @@ class SmearGate(nn.Module):
         super().__init__()
         self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
-    def forward(self, x: Tensor) -> Tensor:
-        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+    def forward(self, x: Tensor, bias: Tensor | None = None) -> Tensor:
+        g = self.gate.to(dtype=x.dtype)[None, None, :]
+        if bias is not None:
+            g = g + bias.to(dtype=x.dtype)
+        g = torch.sigmoid(g)
         x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
         return (1 - g) * x + g * x_prev
 
@@ -606,6 +652,48 @@ class BigramHashEmbedding(nn.Module):
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
+
+
+class PrefixStateController(nn.Module):
+    """Prefix-causal state that modulates BigramHash and SmearGate."""
+    def __init__(self, struct_bits_lut: Tensor, init_scale: float):
+        super().__init__()
+        self.register_buffer("struct_bits_lut", struct_bits_lut.to(dtype=torch.int16), persistent=False)
+        self.route_mix = nn.Parameter((1.5 * torch.eye(STRUCT_STATE_COUNT, dtype=torch.float32)))
+        self.route_bias = nn.Parameter(torch.full((STRUCT_STATE_COUNT,), -4.0, dtype=torch.float32))
+        self.bigram_coeff = nn.Parameter(torch.zeros(STRUCT_STATE_COUNT, dtype=torch.float32))
+        self.smear_coeff = nn.Parameter(torch.zeros(STRUCT_STATE_COUNT, dtype=torch.float32))
+        self.bigram_scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float32))
+        self.smear_scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float32))
+
+    def _field(self, packed_bits: Tensor, shift: int, mask: int) -> Tensor:
+        return torch.bitwise_and(torch.bitwise_right_shift(packed_bits, shift), mask)
+
+    def _recent_active(self, marker: Tensor, window: int) -> Tensor:
+        active = marker
+        for offset in range(1, window):
+            active = torch.maximum(active, F.pad(marker[:, :-offset], (offset, 0)))
+        return active
+
+    def forward(self, token_ids: Tensor) -> tuple[Tensor, Tensor]:
+        packed_bits = self.struct_bits_lut[token_ids.long()].to(torch.int64)
+        markers = [
+            self._field(packed_bits, STRUCT_FLAG_URL_SHIFT, STRUCT_FLAG_URL_MASK).to(torch.float32),
+            self._field(packed_bits, STRUCT_FLAG_CODE_SHIFT, STRUCT_FLAG_CODE_MASK).to(torch.float32),
+            self._field(packed_bits, STRUCT_FLAG_NUMERIC_SHIFT, STRUCT_FLAG_NUMERIC_MASK).to(torch.float32),
+            self._field(packed_bits, STRUCT_FLAG_QUOTE_SHIFT, STRUCT_FLAG_QUOTE_MASK).to(torch.float32),
+        ]
+        states = torch.stack(
+            [self._recent_active(marker, window) for marker, window in zip(markers, STRUCT_ROUTE_WINDOWS, strict=True)],
+            dim=-1,
+        )
+        route_logits = states @ self.route_mix + self.route_bias
+        route = torch.sigmoid(route_logits)
+        bigram_delta = torch.tanh(route @ self.bigram_coeff[:, None])
+        smear_delta = torch.tanh(route @ self.smear_coeff[:, None])
+        bigram_mult = 1.0 + self.bigram_scale.to(dtype=bigram_delta.dtype) * bigram_delta
+        smear_bias = self.smear_scale.to(dtype=smear_delta.dtype) * smear_delta
+        return bigram_mult, smear_bias
 
 
 class Block(nn.Module):
@@ -644,6 +732,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
+        prefix_control_bits_lut: Tensor | None = None,
+        prefix_control_scale: float = 0.10,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -653,6 +743,11 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.prefix_control = (
+            PrefixStateController(prefix_control_bits_lut, prefix_control_scale)
+            if prefix_control_bits_lut is not None
+            else None
+        )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -686,10 +781,17 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        bigram_mult = None
+        smear_bias = None
+        if self.prefix_control is not None:
+            bigram_mult, smear_bias = self.prefix_control(input_ids)
         if self.bigram is not None:
-            x = x + self.bigram(input_ids)
+            bigram = self.bigram(input_ids)
+            if bigram_mult is not None:
+                bigram = bigram * bigram_mult.to(dtype=bigram.dtype)
+            x = x + bigram
         x = F.rms_norm(x, (x.size(-1),))
-        x = self.smear(x)
+        x = self.smear(x, smear_bias)
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
@@ -712,10 +814,17 @@ class GPT(nn.Module):
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        bigram_mult = None
+        smear_bias = None
+        if self.prefix_control is not None:
+            bigram_mult, smear_bias = self.prefix_control(input_ids)
         if self.bigram is not None:
-            x = x + self.bigram(input_ids)
+            bigram = self.bigram(input_ids)
+            if bigram_mult is not None:
+                bigram = bigram * bigram_mult.to(dtype=bigram.dtype)
+            x = x + bigram
         x = F.rms_norm(x, (x.size(-1),))
-        x = self.smear(x)
+        x = self.smear(x, smear_bias)
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
@@ -891,7 +1000,13 @@ def main() -> None:
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+    if args.val_max_tokens > 0:
+        usable_val = min(args.val_max_tokens, val_tokens.numel() - 1)
+        usable_val = (usable_val // args.train_seq_len) * args.train_seq_len
+        if usable_val <= 0:
+            raise ValueError(f"VAL_MAX_TOKENS={args.val_max_tokens} is too small for TRAIN_SEQ_LEN={args.train_seq_len}")
+        val_tokens = val_tokens[: usable_val + 1]
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, struct_bits_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
@@ -913,6 +1028,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        prefix_control_bits_lut=struct_bits_lut if args.prefix_control_enabled else None,
+        prefix_control_scale=args.prefix_control_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -935,6 +1052,17 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
+    if base_model.prefix_control is not None:
+        scalar_params.extend(
+            [
+                base_model.prefix_control.route_mix,
+                base_model.prefix_control.route_bias,
+                base_model.prefix_control.bigram_coeff,
+                base_model.prefix_control.smear_coeff,
+                base_model.prefix_control.bigram_scale,
+                base_model.prefix_control.smear_scale,
+            ]
+        )
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
@@ -988,6 +1116,11 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(f"val_max_tokens:{args.val_max_tokens}")
+    log0(
+        f"prefix_control:enabled={int(args.prefix_control_enabled)} "
+        f"scale:{args.prefix_control_scale:.3f}"
     )
     log0(f"seed:{args.seed}")
 

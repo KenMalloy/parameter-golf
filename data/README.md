@@ -52,6 +52,26 @@ python3 data/download_hf_docs_and_tokenize.py \
 
 The sidecar `docs_selected.source_manifest.json` includes `docs_sha256`, so users can verify they are rebuilding from the exact same document list and order as the baseline export.
 
+## Building A Training-Only Proxy
+
+For fast tokenizer-first experiments, you can freeze a small proxy corpus sampled only from the published training-doc region, then retokenize and export shards locally:
+
+```bash
+python3 data/build_training_proxy.py \
+  --docs-jsonl ./data/docs_selected.jsonl \
+  --output-root /tmp/fineweb_proxy_spikes \
+  --sample-docs 512 \
+  --seed 20260328 \
+  --proxy-val-docs 64
+```
+
+This writes:
+- `docs_proxy_train.jsonl` with the sampled docs in original source order
+- `tokenizers/` and `datasets/` for each tokenizer config
+- `proxy_manifest.json`, including the frozen sampled doc indices and source `docs_sha256`
+
+The proxy never samples from the leading source validation-doc region, so it is safe for inner-loop development while keeping the official validation split out of the workflow.
+
 ## Useful Knobs
 
 For CPU-heavy exports, useful knobs are:
